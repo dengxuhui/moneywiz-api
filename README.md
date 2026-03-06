@@ -3,9 +3,8 @@
 ![Static Badge](https://img.shields.io/badge/Python-3-blue?style=flat&logo=Python)
 ![PyPI](https://img.shields.io/pypi/v/moneywiz-api)
 
-<a href="https://www.buymeacoffee.com/Ileodo" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
-
 一个用于访问 MoneyWiz SQLite 数据库的 Python API，支持读取账户/分类/交易，并提供 CLI 工具。
+Fork的分支支持写入账单，配合Agent功能让记账体验起飞！
 
 ## 功能概览
 
