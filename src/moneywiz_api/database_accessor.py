@@ -1,12 +1,16 @@
 import sqlite3
 from collections import defaultdict
-from pathlib import Path
-from typing import Dict, List, Any, Callable, Tuple
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
+from typing import Dict, List, Any, Callable, Tuple, Optional
+import random
+from uuid import uuid4
 
 from moneywiz_api.model.record import Record
 from moneywiz_api.model.raw_data_handler import RawDataHandler as RDH
 from moneywiz_api.types import ENT_ID, ID, GID
+from moneywiz_api.utils import get_date, get_datetime
 
 
 class DatabaseAccessor:
@@ -43,10 +47,10 @@ class DatabaseAccessor:
             f"{key}: {value}" for key, value in self._ent_to_typename.items()
         )
 
-    def typename_for(self, ent_id: ENT_ID) -> str:
+    def typename_for(self, ent_id: ENT_ID) -> Optional[str]:
         return self._ent_to_typename.get(ent_id)
 
-    def ent_for(self, typename: str) -> ENT_ID:
+    def ent_for(self, typename: str) -> Optional[ENT_ID]:
         return self._typename_to_ent.get(typename)
 
     def query_objects(self, typenames: List[str]) -> List[Any]:
@@ -137,3 +141,500 @@ class DatabaseAccessor:
         for row in res.fetchall():
             users_map[row["Z_PK"]] = row["ZSYNCLOGIN"]
         return users_map
+
+    def get_account_currency(self, account_id: ID) -> Optional[str]:
+        cur = self._con.cursor()
+        res = cur.execute(
+            """
+        SELECT ZCURRENCYNAME FROM ZSYNCOBJECT WHERE Z_PK = ?
+        """,
+            [account_id],
+        )
+        row = res.fetchone()
+        if not row:
+            return None
+        return row["ZCURRENCYNAME"]
+
+    def get_account_meta(self, account_id: ID) -> Optional[Tuple[str, ENT_ID]]:
+        cur = self._con.cursor()
+        res = cur.execute(
+            """
+        SELECT ZCURRENCYNAME, Z_ENT FROM ZSYNCOBJECT WHERE Z_PK = ?
+        """,
+            [account_id],
+        )
+        row = res.fetchone()
+        if not row:
+            return None
+        currency = row["ZCURRENCYNAME"]
+        account_ent = row["Z_ENT"]
+        if currency is None or account_ent is None:
+            return None
+        return currency, account_ent
+
+    def has_record(self, record_id: ID) -> bool:
+        cur = self._con.cursor()
+        res = cur.execute(
+            """
+        SELECT Z_PK FROM ZSYNCOBJECT WHERE Z_PK = ?
+        """,
+            [record_id],
+        )
+        return res.fetchone() is not None
+
+    def get_account_exchange_rate(self, account_id: ID) -> float:
+        cur = self._con.cursor()
+        res = cur.execute(
+            """
+        SELECT ZCURRENCYEXCHANGERATE
+        FROM ZSYNCOBJECT
+        WHERE ZACCOUNT2 = ? AND ZCURRENCYEXCHANGERATE IS NOT NULL
+        ORDER BY ZDATE1 DESC, Z_PK DESC
+        LIMIT 1
+        """,
+            [account_id],
+        )
+        row = res.fetchone()
+        if not row:
+            return 1.0
+        rate = row["ZCURRENCYEXCHANGERATE"]
+        if rate is None:
+            return 1.0
+        return float(rate)
+
+    def _next_pk_id(self) -> ID:
+        cur = self._con.cursor()
+        res = cur.execute(
+            """
+        SELECT COALESCE(MAX(Z_PK), 0) + 1 AS NEXT_PK FROM ZSYNCOBJECT
+        """
+        )
+        row = res.fetchone()
+        return row["NEXT_PK"]
+
+    def _next_category_assignment_id(self) -> ID:
+        cur = self._con.cursor()
+        res = cur.execute(
+            """
+        SELECT COALESCE(MAX(Z_PK), 0) + 1 AS NEXT_PK FROM ZCATEGORYASSIGMENT
+        """
+        )
+        row = res.fetchone()
+        return row["NEXT_PK"]
+
+    def find_category_id(
+        self, category_name: str, *, for_expense: bool
+    ) -> Optional[ID]:
+        cur = self._con.cursor()
+        type_value = 1 if for_expense else 2
+
+        exact = cur.execute(
+            """
+        SELECT Z_PK
+        FROM ZSYNCOBJECT
+        WHERE Z_ENT = 19 AND ZTYPE2 = ? AND ZNAME2 = ?
+        ORDER BY ZUSER3 DESC, Z_PK DESC
+        LIMIT 1
+        """,
+            [type_value, category_name],
+        ).fetchone()
+        if exact:
+            return exact["Z_PK"]
+
+        fuzzy = cur.execute(
+            """
+        SELECT Z_PK
+        FROM ZSYNCOBJECT
+        WHERE Z_ENT = 19 AND ZTYPE2 = ? AND ZNAME2 LIKE ?
+        ORDER BY ZUSER3 DESC, Z_PK DESC
+        LIMIT 1
+        """,
+            [type_value, f"%{category_name}%"],
+        ).fetchone()
+        if fuzzy:
+            return fuzzy["Z_PK"]
+
+        return None
+
+    def ensure_category_assignment(
+        self,
+        *,
+        transaction_id: ID,
+        transaction_ent_id: ENT_ID,
+        category_id: ID,
+        amount: Decimal,
+    ) -> ID:
+        cur = self._con.cursor()
+        existing = cur.execute(
+            """
+        SELECT Z_PK
+        FROM ZCATEGORYASSIGMENT
+        WHERE ZTRANSACTION = ? AND ZCATEGORY = ?
+        LIMIT 1
+        """,
+            [transaction_id, category_id],
+        ).fetchone()
+        if existing:
+            cur.execute(
+                """
+            UPDATE ZCATEGORYASSIGMENT
+            SET ZAMOUNT = ?, Z36_TRANSACTION = ?
+            WHERE Z_PK = ?
+            """,
+                [float(amount), transaction_ent_id, existing["Z_PK"]],
+            )
+            return existing["Z_PK"]
+
+        assignment_id = self._next_category_assignment_id()
+        cur.execute(
+            """
+        INSERT INTO ZCATEGORYASSIGMENT (
+            Z_PK,
+            Z_ENT,
+            Z_OPT,
+            ZASSIGMENTNUMBER,
+            ZCATEGORY,
+            ZTRANSACTION,
+            Z36_TRANSACTION,
+            ZAMOUNT
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            [
+                assignment_id,
+                2,
+                1,
+                0,
+                category_id,
+                transaction_id,
+                transaction_ent_id,
+                float(amount),
+            ],
+        )
+        return assignment_id
+
+    def suggest_categories(
+        self,
+        *,
+        kind: str,
+        text: Optional[str] = None,
+        account_id: Optional[ID] = None,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        kind_to_meta = {
+            "expense": (47, 1),
+            "income": (37, 2),
+        }
+        if kind not in kind_to_meta:
+            raise ValueError(f"Unsupported kind: {kind}")
+        if limit <= 0:
+            return []
+
+        tx_ent, category_type = kind_to_meta[kind]
+        cur = self._con.cursor()
+
+        rows = cur.execute(
+            """
+        SELECT
+            t.Z_PK AS tx_id,
+            t.ZDESC2 AS tx_desc,
+            t.ZDATE1 AS tx_date,
+            t.ZACCOUNT2 AS tx_account_id,
+            t.ZPAYEE2 AS payee_id,
+            ca.ZCATEGORY AS category_id,
+            c.ZNAME2 AS category_name,
+            c.ZPARENTCATEGORY AS category_parent,
+            c.ZTYPE2 AS category_type,
+            p.ZNAME5 AS payee_name
+        FROM ZSYNCOBJECT t
+        JOIN ZCATEGORYASSIGMENT ca ON ca.ZTRANSACTION = t.Z_PK
+        JOIN ZSYNCOBJECT c ON c.Z_PK = ca.ZCATEGORY
+        LEFT JOIN ZSYNCOBJECT p ON p.Z_PK = t.ZPAYEE2
+        WHERE t.Z_ENT = ?
+          AND c.Z_ENT = 19
+          AND c.ZTYPE2 = ?
+          AND ca.ZCATEGORY IS NOT NULL
+          AND ca.ZTRANSACTION IS NOT NULL
+        ORDER BY t.ZDATE1 DESC, t.Z_PK DESC
+        LIMIT 3000
+        """,
+            [tx_ent, category_type],
+        ).fetchall()
+
+        text_query = (text or "").strip().lower()
+        query_tokens = [
+            token for token in text_query.replace("/", " ").split() if token
+        ]
+
+        categories = cur.execute(
+            """
+        SELECT Z_PK, ZNAME2, ZPARENTCATEGORY
+        FROM ZSYNCOBJECT
+        WHERE Z_ENT = 19
+        """
+        ).fetchall()
+        category_map: Dict[ID, Tuple[str, Optional[ID]]] = {
+            row["Z_PK"]: (row["ZNAME2"], row["ZPARENTCATEGORY"]) for row in categories
+        }
+
+        def category_path(category_id: ID) -> str:
+            parts: List[str] = []
+            current = category_id
+            guard = 0
+            while current in category_map and guard < 10:
+                guard += 1
+                name, parent_id = category_map[current]
+                parts.insert(0, name)
+                if parent_id is None:
+                    break
+                current = parent_id
+            return " / ".join(parts)
+
+        now_value = get_date(datetime.now())
+        stats: Dict[ID, Dict[str, Any]] = {}
+
+        for row in rows:
+            if account_id is not None:
+                if row["tx_account_id"] != account_id:
+                    continue
+
+            description = (row["tx_desc"] or "").lower()
+            payee_name = (row["payee_name"] or "").lower()
+
+            if text_query:
+                matched = text_query in description or text_query in payee_name
+                token_overlap = 0
+                for token in query_tokens:
+                    if token in description or token in payee_name:
+                        token_overlap += 1
+                if not matched and token_overlap == 0:
+                    continue
+            else:
+                token_overlap = 0
+
+            age_days = 0.0
+            if row["tx_date"] is not None:
+                age_days = max(0.0, (now_value - row["tx_date"]) / 86400)
+
+            score = 1.0
+            if text_query:
+                if text_query in description:
+                    score += 6.0
+                if text_query in payee_name:
+                    score += 5.0
+                score += token_overlap * 1.5
+            score += max(0.0, 2.0 - age_days / 30.0)
+
+            category_id = row["category_id"]
+            if category_id not in stats:
+                stats[category_id] = {
+                    "category_id": category_id,
+                    "category_name": row["category_name"],
+                    "category_path": category_path(category_id),
+                    "score": 0.0,
+                    "hit_count": 0,
+                    "last_date_value": row["tx_date"],
+                }
+
+            item = stats[category_id]
+            item["score"] += score
+            item["hit_count"] += 1
+            if row["tx_date"] is not None and (
+                item["last_date_value"] is None
+                or row["tx_date"] > item["last_date_value"]
+            ):
+                item["last_date_value"] = row["tx_date"]
+
+        ranked = sorted(
+            stats.values(),
+            key=lambda x: (x["score"], x["hit_count"], x["last_date_value"] or 0),
+            reverse=True,
+        )[:limit]
+
+        result: List[Dict[str, Any]] = []
+        for item in ranked:
+            last_used_at = None
+            if item["last_date_value"] is not None:
+                last_used_at = get_datetime(item["last_date_value"]).isoformat(sep=" ")
+            result.append(
+                {
+                    "category_id": item["category_id"],
+                    "category_name": item["category_name"],
+                    "category_path": item["category_path"],
+                    "score": round(item["score"], 3),
+                    "hit_count": item["hit_count"],
+                    "last_used_at": last_used_at,
+                }
+            )
+        return result
+
+    def add_cash_transaction(
+        self,
+        *,
+        kind: str,
+        account_id: ID,
+        amount: Decimal,
+        description: str,
+        transaction_datetime: datetime,
+        original_currency: str,
+        notes: Optional[str] = None,
+        payee_id: Optional[ID] = None,
+        dedupe_window_seconds: int = 600,
+        dedupe_amount_tolerance: Decimal = Decimal("0.01"),
+        category_name: Optional[str] = None,
+    ) -> Tuple[ID, bool]:
+        kind_to_ent = {
+            "expense": "WithdrawTransaction",
+            "income": "DepositTransaction",
+        }
+        if kind not in kind_to_ent:
+            raise ValueError(f"Unsupported kind: {kind}")
+
+        if not description:
+            raise ValueError("description cannot be empty")
+
+        if kind == "expense":
+            normalized_amount = -abs(amount)
+            flags = 0
+        else:
+            normalized_amount = abs(amount)
+            flags = 1
+
+        ent_id = self.ent_for(kind_to_ent[kind])
+        if ent_id is None:
+            raise RuntimeError(f"Cannot find ENT for {kind_to_ent[kind]}")
+
+        account_meta = self.get_account_meta(account_id)
+        if account_meta is None:
+            raise ValueError(f"Account {account_id} not found or has no meta")
+        _, account_ent = account_meta
+
+        cur = self._con.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+
+            date_value = get_date(transaction_datetime)
+            duplicate = cur.execute(
+                """
+            SELECT Z_PK
+            FROM ZSYNCOBJECT
+            WHERE Z_ENT = ?
+              AND ZACCOUNT2 = ?
+              AND ABS(ZAMOUNT1 - ?) <= ?
+              AND ABS(ZDATE1 - ?) <= ?
+            ORDER BY ABS(ZDATE1 - ?) ASC, Z_PK DESC
+            LIMIT 1
+            """,
+                [
+                    ent_id,
+                    account_id,
+                    float(normalized_amount),
+                    float(dedupe_amount_tolerance),
+                    date_value,
+                    dedupe_window_seconds,
+                    date_value,
+                ],
+            ).fetchone()
+            if duplicate:
+                if category_name:
+                    category_id = self.find_category_id(
+                        category_name,
+                        for_expense=(kind == "expense"),
+                    )
+                    if category_id is not None:
+                        self.ensure_category_assignment(
+                            transaction_id=duplicate["Z_PK"],
+                            transaction_ent_id=ent_id,
+                            category_id=category_id,
+                            amount=normalized_amount,
+                        )
+                        self._con.commit()
+                    else:
+                        self._con.rollback()
+                else:
+                    self._con.rollback()
+                return duplicate["Z_PK"], False
+
+            next_id = self._next_pk_id()
+            gid = (
+                f"{str(uuid4()).upper()}-{random.randint(10000, 99999)}-"
+                f"{uuid4().hex[:16].upper()}"
+            )
+            now_value = get_date(datetime.now())
+            exchange_rate = self.get_account_exchange_rate(account_id)
+
+            cur.execute(
+                """
+            INSERT INTO ZSYNCOBJECT (
+                Z_PK,
+                Z_ENT,
+                Z_OPT,
+                ZFLAGS1,
+                ZRECONCILED,
+                ZSTATUS1,
+                ZVOIDCHEQUE,
+                ZACCOUNT2,
+                Z9_ACCOUNT2,
+                ZPAYEE2,
+                ZOBJECTCREATIONDATE,
+                ZAMOUNT1,
+                ZCURRENCYEXCHANGERATE,
+                ZDATE1,
+                ZFEE2,
+                ZORIGINALAMOUNT,
+                ZORIGINALEXCHANGERATE,
+                ZORIGINALFEE,
+                ZPRICEPERSHARE1,
+                ZGID,
+                ZCHECKBOOKNUMBER,
+                ZDESC2,
+                ZNOTES1,
+                ZORIGINALCURRENCY
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+                [
+                    next_id,
+                    ent_id,
+                    1,
+                    flags,
+                    0,
+                    2,
+                    0,
+                    account_id,
+                    account_ent,
+                    payee_id,
+                    now_value,
+                    float(normalized_amount),
+                    exchange_rate,
+                    date_value,
+                    0.0,
+                    float(normalized_amount),
+                    1.0,
+                    0.0,
+                    0.0,
+                    gid,
+                    "",
+                    description,
+                    notes or "",
+                    original_currency,
+                ],
+            )
+
+            if category_name:
+                category_id = self.find_category_id(
+                    category_name,
+                    for_expense=(kind == "expense"),
+                )
+                if category_id is not None:
+                    self.ensure_category_assignment(
+                        transaction_id=next_id,
+                        transaction_ent_id=ent_id,
+                        category_id=category_id,
+                        amount=normalized_amount,
+                    )
+            self._con.commit()
+            return next_id, True
+        except Exception:
+            self._con.rollback()
+            raise
