@@ -261,7 +261,7 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     type=int,
     default=600,
     show_default=True,
-    help="去重时间窗口（秒）：同账户同类型同金额且在窗口内则不重复写入",
+    help="去重时间窗口（秒）：同时间窗口内金额相同则视为重复",
 )
 @click.option(
     "--audit-log-path",
@@ -331,37 +331,6 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     help="查看自动记账审计日志并退出",
 )
 @click.option(
-    "--suggest-category",
-    is_flag=True,
-    help="基于历史交易给出分类建议并退出",
-)
-@click.option(
-    "--suggest-text",
-    type=str,
-    default=None,
-    help="分类建议时使用的文本（商家/描述/OCR片段）",
-)
-@click.option(
-    "--suggest-kind",
-    type=click.Choice(["expense", "income"], case_sensitive=False),
-    default="expense",
-    show_default=True,
-    help="分类建议场景类型",
-)
-@click.option(
-    "--suggest-account-id",
-    type=int,
-    default=None,
-    help="分类建议时限定账户 ID（可选）",
-)
-@click.option(
-    "--suggest-limit",
-    type=int,
-    default=5,
-    show_default=True,
-    help="分类建议返回条数",
-)
-@click.option(
     "--last",
     "last_n_logs",
     type=int,
@@ -394,11 +363,6 @@ def main(
     sync_mode,
     sync_wait_seconds,
     show_auto_logs,
-    suggest_category,
-    suggest_text,
-    suggest_kind,
-    suggest_account_id,
-    suggest_limit,
     last_n_logs,
 ):
     """
@@ -434,36 +398,6 @@ def main(
         )
         for event in events:
             click.echo(json.dumps(event, ensure_ascii=False, sort_keys=True, indent=2))
-        return
-
-    if suggest_category:
-        if suggest_limit <= 0:
-            raise ValueError("--suggest-limit must be a positive integer")
-
-        db_path = Path(db_file_path)
-        moneywiz_api = MoneywizApi(db_path)
-        accessor = moneywiz_api.accessor
-        suggest = getattr(accessor, "suggest_categories")
-        suggestions = suggest(
-            kind=suggest_kind.lower(),
-            text=suggest_text,
-            account_id=suggest_account_id,
-            limit=suggest_limit,
-        )
-        click.echo(
-            json.dumps(
-                {
-                    "db_path": str(db_path),
-                    "suggest_kind": suggest_kind.lower(),
-                    "suggest_text": suggest_text,
-                    "suggest_account_id": suggest_account_id,
-                    "suggestions": suggestions,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                indent=2,
-            )
-        )
         return
 
     db_path = Path(db_file_path)

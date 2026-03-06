@@ -93,11 +93,6 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - `--datetime`：交易时间（可选，格式 `YYYY-mm-dd HH:MM:SS` 或 `YYYY-mm-dd`）
 - `--dedupe-window-seconds`：去重窗口秒数（默认 600）
 - `--audit-log-path`：审计日志路径（默认 `~/.moneywiz_api/auto_bookkeeping.jsonl`）
-- `--suggest-category`：按历史交易给出分类建议并退出
-- `--suggest-text`：建议时输入的商家/描述/OCR 文本
-- `--suggest-kind`：建议场景类型（`expense` / `income`）
-- `--suggest-account-id`：建议时限定账户（可选）
-- `--suggest-limit`：建议返回条数
 - `--allow-main-db-write`：允许写主库（默认禁用）
 - `--skip-sidecar-check`：跳过写锁预检查（不建议）
 - `--backup-before-write / --no-backup-before-write`：写前是否备份（默认开启）
@@ -114,20 +109,7 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" --show-auto-logs --last 50
 ```
 
-### 4) 获取分类建议（给 OCR/Agent 使用）
-
-```bash
-moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
-  --suggest-category \
-  --suggest-kind expense \
-  --suggest-text "711 早餐" \
-  --suggest-account-id 1683 \
-  --suggest-limit 5
-```
-
-返回 JSON，包含建议分类列表（`category_id`、`category_name`、`category_path`、`score`、`hit_count`、`last_used_at`）。
-
-### 5) 写入后触发同步
+### 4) 写入后触发同步
 
 你可以在写入成功后自动执行一个本机同步命令，把新增账单同步到云端，再让其他设备拉取。
 
@@ -171,7 +153,7 @@ export MONEYWIZ_SYNC_COMMAND="open -a MoneyWiz"
 
 ## 去重与审计机制
 
-- 写入前按“同类型 + 同账户 + 同金额（容差 0.01）+ 时间窗口”做去重
+- 写入前按“同时间窗口 + 同金额（容差 0.01）”做去重（不区分账户）
 - 命中重复时不会写入新记录，会返回并记录已有交易 ID
 - 每次写入（成功/失败）都会写入 JSONL 审计日志
 
@@ -238,7 +220,7 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 
 建议流程（OCR 场景）：
 
-1. 先调用 `--suggest-category` 获取候选分类
+1. 由 Agent 先读取数据库并做分类预测
 2. 若置信度高，写入时传 `--category`
 3. 若置信度低，不传 `--category`，后续手工补分类
 4. 如需多设备同步，在写入命令中增加 `--trigger-sync`
@@ -294,9 +276,9 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - 从截图中提取：`kind`（收入/支出）、`amount`、`description/merchant`、`time`、`account`
 - 若缺失关键字段（如金额或账户），AI 应终止写入并返回缺失信息
 
-2. 分类建议
+2. 分类处理
 
-- 先调用 `--suggest-category` 获取候选分类
+- 由 Agent 读取 DB 后进行分类预测
 - 若置信度高：写入命令带 `--category`
 - 若置信度低：不传 `--category`，备注中标记“待分类”
 
@@ -316,3 +298,124 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - 每次写入后记录审计日志（JSONL）
 - AI 回执至少包含：`action`（inserted/deduplicated）、`created_id`、`amount`、`desc`、`category`、`sync_status`
 - 失败时返回：错误原因 + 未写入确认 + 建议修复动作
+
+## Agent 初始化问询流程（首次接入）
+
+用于让 AI Agent 在第一次接入你的记账流程时完成必要配置，减少后续反复确认。
+
+1. 数据库与环境确认
+
+- 确认 MoneyWiz 主库绝对路径
+- 确认是否允许写主库
+- 可选：先用测试库演练 1~3 笔
+
+2. 写入安全策略
+
+- 写入前若检测到 MoneyWiz 正在运行，默认中止并提醒关闭
+- 开启写前自动备份（推荐）
+- 确认备份目录（默认 `~/.moneywiz_api/backups`）
+
+3. 账户映射设置
+
+- 设置默认支出账户（账户名或 ID）
+- 设置默认收入账户（账户名或 ID）
+- OCR 未识别到账户时是否自动用默认账户（推荐：是）
+
+4. 分类处理策略
+
+- 分类预测由 Agent 端读取数据库后完成
+- 置信度高时传 `--category`
+- 置信度低时不传 `--category`，在备注标记“待分类”
+
+5. 去重参数设置
+
+- 当前规则：同时间窗口内金额相同即判重
+- 确认 `--dedupe-window-seconds`（默认 600）
+
+6. 同步策略设置
+
+- 是否启用写后自动同步
+- 推荐：`--sync-mode applescript`
+- 确认 `--sync-wait-seconds`（默认 20）
+- 多条账单场景：仅最后一条带 `--trigger-sync`
+
+7. 审计与回执规范
+
+- 确认审计日志路径（默认 `~/.moneywiz_api/auto_bookkeeping.jsonl`）
+- 成功回执最少包含：`action`、`created_id`、`amount`、`desc`、`category`、`sync_status`
+- 失败回执必须包含：错误原因、未写入确认、修复建议
+
+8. OCR 输入执行规则
+
+- 同一截图多条账单：按时间顺序逐条写入
+- 前 N-1 条不触发同步，最后一条触发同步
+- 关键字段缺失（金额/账户）时，中止该条并输出缺失项
+
+9. 首次联调步骤
+
+- 先做 1 笔单条写入联调（含同步与审计）
+- 再做 1 次多条批量联调（仅最后一条同步）
+- 通过后切换正式自动化
+
+### 初始化配置模板（可让 Agent 持久化）
+
+```yaml
+moneywiz:
+  db_path: "/ABS/PATH/ipadMoneyWiz.sqlite"
+  allow_main_db_write: true
+  backup_before_write: true
+  backup_dir: "~/.moneywiz_api/backups"
+  audit_log_path: "~/.moneywiz_api/auto_bookkeeping.jsonl"
+
+defaults:
+  expense_account_id: 1683
+  income_account_id: 1683
+  dedupe_window_seconds: 600
+
+classification:
+  mode: "agent_predict"
+  low_confidence_action: "skip_category"
+  low_confidence_note_tag: "待分类"
+
+sync:
+  enabled: true
+  mode: "applescript"
+  wait_seconds: 20
+  trigger_on_last_item_only: true
+
+execution:
+  stop_if_moneywiz_running: true
+  require_fields: ["kind", "amount", "account_id", "description"]
+```
+
+## CLI 与 Agent 责任划分
+
+为保证稳定性与可维护性，建议采用“Agent 负责智能决策，CLI 负责安全执行”的边界。
+
+### CLI 负责（执行层）
+
+- 参数化写入账单（收入/支出）
+- 账单字段落库：账户、金额、描述、备注、时间、收付款对象、分类（可选）
+- 去重控制（同时间窗口 + 同金额）
+- 写入安全保护：
+  - 检查 MoneyWiz 进程是否运行
+  - 写锁预检查
+  - 主库写入显式开关
+  - 写前备份
+- 审计日志落盘（成功/失败/去重/同步结果）
+- 同步触发（applescript 或 command）
+
+### Agent 负责（智能层）
+
+- OCR 结果解析与结构化（商家、金额、时间、账户线索）
+- 交易类型判断（收入/支出）
+- 账户映射（自然语言到账户 ID）
+- 分类预测（读取数据库后推断，支持模糊场景）
+- 多条账单编排（前 N-1 条不触发同步，最后一条触发同步）
+- 失败重试策略与用户交互（缺失字段、冲突、人工确认）
+
+### 交互契约（推荐）
+
+- Agent 给 CLI：只传“确定字段”，不做越权数据库操作
+- CLI 给 Agent：返回结构化执行结果（inserted/deduplicated/failed + id + 错误）
+- Agent 再给用户：人类可读总结 + 下一步建议

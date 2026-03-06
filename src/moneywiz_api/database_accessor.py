@@ -312,161 +312,6 @@ class DatabaseAccessor:
         )
         return assignment_id
 
-    def suggest_categories(
-        self,
-        *,
-        kind: str,
-        text: Optional[str] = None,
-        account_id: Optional[ID] = None,
-        limit: int = 5,
-    ) -> List[Dict[str, Any]]:
-        kind_to_meta = {
-            "expense": (47, 1),
-            "income": (37, 2),
-        }
-        if kind not in kind_to_meta:
-            raise ValueError(f"Unsupported kind: {kind}")
-        if limit <= 0:
-            return []
-
-        tx_ent, category_type = kind_to_meta[kind]
-        cur = self._con.cursor()
-
-        rows = cur.execute(
-            """
-        SELECT
-            t.Z_PK AS tx_id,
-            t.ZDESC2 AS tx_desc,
-            t.ZDATE1 AS tx_date,
-            t.ZACCOUNT2 AS tx_account_id,
-            t.ZPAYEE2 AS payee_id,
-            ca.ZCATEGORY AS category_id,
-            c.ZNAME2 AS category_name,
-            c.ZPARENTCATEGORY AS category_parent,
-            c.ZTYPE2 AS category_type,
-            p.ZNAME5 AS payee_name
-        FROM ZSYNCOBJECT t
-        JOIN ZCATEGORYASSIGMENT ca ON ca.ZTRANSACTION = t.Z_PK
-        JOIN ZSYNCOBJECT c ON c.Z_PK = ca.ZCATEGORY
-        LEFT JOIN ZSYNCOBJECT p ON p.Z_PK = t.ZPAYEE2
-        WHERE t.Z_ENT = ?
-          AND c.Z_ENT = 19
-          AND c.ZTYPE2 = ?
-          AND ca.ZCATEGORY IS NOT NULL
-          AND ca.ZTRANSACTION IS NOT NULL
-        ORDER BY t.ZDATE1 DESC, t.Z_PK DESC
-        LIMIT 3000
-        """,
-            [tx_ent, category_type],
-        ).fetchall()
-
-        text_query = (text or "").strip().lower()
-        query_tokens = [
-            token for token in text_query.replace("/", " ").split() if token
-        ]
-
-        categories = cur.execute(
-            """
-        SELECT Z_PK, ZNAME2, ZPARENTCATEGORY
-        FROM ZSYNCOBJECT
-        WHERE Z_ENT = 19
-        """
-        ).fetchall()
-        category_map: Dict[ID, Tuple[str, Optional[ID]]] = {
-            row["Z_PK"]: (row["ZNAME2"], row["ZPARENTCATEGORY"]) for row in categories
-        }
-
-        def category_path(category_id: ID) -> str:
-            parts: List[str] = []
-            current = category_id
-            guard = 0
-            while current in category_map and guard < 10:
-                guard += 1
-                name, parent_id = category_map[current]
-                parts.insert(0, name)
-                if parent_id is None:
-                    break
-                current = parent_id
-            return " / ".join(parts)
-
-        now_value = get_date(datetime.now())
-        stats: Dict[ID, Dict[str, Any]] = {}
-
-        for row in rows:
-            if account_id is not None:
-                if row["tx_account_id"] != account_id:
-                    continue
-
-            description = (row["tx_desc"] or "").lower()
-            payee_name = (row["payee_name"] or "").lower()
-
-            if text_query:
-                matched = text_query in description or text_query in payee_name
-                token_overlap = 0
-                for token in query_tokens:
-                    if token in description or token in payee_name:
-                        token_overlap += 1
-                if not matched and token_overlap == 0:
-                    continue
-            else:
-                token_overlap = 0
-
-            age_days = 0.0
-            if row["tx_date"] is not None:
-                age_days = max(0.0, (now_value - row["tx_date"]) / 86400)
-
-            score = 1.0
-            if text_query:
-                if text_query in description:
-                    score += 6.0
-                if text_query in payee_name:
-                    score += 5.0
-                score += token_overlap * 1.5
-            score += max(0.0, 2.0 - age_days / 30.0)
-
-            category_id = row["category_id"]
-            if category_id not in stats:
-                stats[category_id] = {
-                    "category_id": category_id,
-                    "category_name": row["category_name"],
-                    "category_path": category_path(category_id),
-                    "score": 0.0,
-                    "hit_count": 0,
-                    "last_date_value": row["tx_date"],
-                }
-
-            item = stats[category_id]
-            item["score"] += score
-            item["hit_count"] += 1
-            if row["tx_date"] is not None and (
-                item["last_date_value"] is None
-                or row["tx_date"] > item["last_date_value"]
-            ):
-                item["last_date_value"] = row["tx_date"]
-
-        ranked = sorted(
-            stats.values(),
-            key=lambda x: (x["score"], x["hit_count"], x["last_date_value"] or 0),
-            reverse=True,
-        )[:limit]
-
-        result: List[Dict[str, Any]] = []
-        for item in ranked:
-            last_used_at = None
-            if item["last_date_value"] is not None:
-                last_used_at = get_datetime(item["last_date_value"]).isoformat(sep=" ")
-            result.append(
-                {
-                    "category_id": item["category_id"],
-                    "category_name": item["category_name"],
-                    "category_path": item["category_path"],
-                    "score": round(item["score"], 3),
-                    "hit_count": item["hit_count"],
-                    "last_used_at": last_used_at,
-                }
-            )
-        return result
-
     def add_cash_transaction(
         self,
         *,
@@ -517,16 +362,13 @@ class DatabaseAccessor:
                 """
             SELECT Z_PK
             FROM ZSYNCOBJECT
-            WHERE Z_ENT = ?
-              AND ZACCOUNT2 = ?
+            WHERE Z_ENT IN (37, 47)
               AND ABS(ZAMOUNT1 - ?) <= ?
               AND ABS(ZDATE1 - ?) <= ?
             ORDER BY ABS(ZDATE1 - ?) ASC, Z_PK DESC
             LIMIT 1
             """,
                 [
-                    ent_id,
-                    account_id,
                     float(normalized_amount),
                     float(dedupe_amount_tolerance),
                     date_value,
