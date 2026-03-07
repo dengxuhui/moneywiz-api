@@ -135,13 +135,16 @@ def _detect_moneywiz_app_id() -> Optional[str]:
 
     for app_id in candidates:
         check = subprocess.run(
-            ["osascript", "-e", f'id of app "{app_id}"'],
+            [
+                "mdfind",
+                f"kMDItemCFBundleIdentifier == '{app_id}' && kMDItemKind == 'Application'",
+            ],
             check=False,
             capture_output=True,
             text=True,
             timeout=5,
         )
-        if check.returncode == 0:
+        if check.returncode == 0 and check.stdout.strip():
             return app_id
 
     check_name = subprocess.run(

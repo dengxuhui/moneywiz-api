@@ -334,8 +334,9 @@ class DatabaseAccessor:
         if kind not in kind_to_ent:
             raise ValueError(f"Unsupported kind: {kind}")
 
-        if not description:
-            raise ValueError("description cannot be empty")
+        if description is None:
+            raise ValueError("description cannot be None")
+        description = description.strip()
 
         if kind == "expense":
             normalized_amount = -abs(amount)

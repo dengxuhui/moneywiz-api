@@ -88,6 +88,7 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - `--account-id`：目标账户 ID
 - `--amount`：金额（传正数）
 - `--desc`：账单描述
+- `--desc`：账单描述（可为空字符串，建议尽量提供可读内容）
 - `--notes`：备注（可选）
 - `--category`：分类名称（可选，会匹配现有分类并写入分类关联）
 - `--datetime`：交易时间（可选，格式 `YYYY-mm-dd HH:MM:SS` 或 `YYYY-mm-dd`）
