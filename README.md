@@ -92,6 +92,7 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - `--notes`：备注（可选）
 - `--category`：分类名称（可选，会匹配现有分类并写入分类关联）
 - `--datetime`：交易时间（可选，格式 `YYYY-mm-dd HH:MM:SS` 或 `YYYY-mm-dd`）
+- `--input-timezone`：`--datetime` 的输入时区（默认 `Asia/Shanghai`），写库统一按 UTC0 计算
 - `--dedupe-window-seconds`：去重窗口秒数（默认 600）
 - `--audit-log-path`：审计日志路径（默认 `~/.moneywiz_api/auto_bookkeeping.jsonl`）
 - `--allow-main-db-write`：允许写主库（默认禁用）
@@ -106,7 +107,6 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - `--sync-wait-mode`：`applescript` 等待模式，`stateful`（默认）或 `fixed`
 - `--sync-poll-interval-seconds`：`stateful` 模式轮询间隔（默认 2 秒）
 - `--sync-stable-cycles`：`stateful` 模式判定完成所需连续稳定次数（默认 3）
-- `--nudge-sync / --no-nudge-sync`：同步前是否先对新交易做轻量更新（默认开启，实验性）
 
 ### 3) 查看自动记账审计日志
 
@@ -138,8 +138,9 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 尽量在“同步空闲”后立即关闭，而不是固定睡眠。
 若超时仍未空闲，则按失败处理并保留审计信息。
 
-为提高“直写数据库后被 MoneyWiz 同步引擎感知”的概率，
-默认会在触发同步前对新交易执行一次轻量 nudge（更新 `Z_OPT` 等字段）。
+CLI 写入交易时会同步写入 `ZSYNCCOMMAND` 交易对象命令（`ZOBJECTTYPE=1`），
+用于更接近 MoneyWiz 的同步队列行为。
+
 
 `applescript` 模式会自动探测本机已安装的 MoneyWiz（优先 Setapp 版本），
 无需用户手动提供 app 名称或 bundle id。
@@ -435,3 +436,104 @@ execution:
 - Agent 给 CLI：只传“确定字段”，不做越权数据库操作
 - CLI 给 Agent：返回结构化执行结果（inserted/deduplicated/failed + id + 错误）
 - Agent 再给用户：人类可读总结 + 下一步建议
+
+## 已验证可同步模板（推荐给 Agent）
+
+以下模板已在本机（Setapp 版 MoneyWiz）验证可触发云端同步，可作为 Agent 默认命令。
+
+```bash
+PYTHONPATH="/Users/dengxuhui/Work/Personal/moneywiz-api/src" \
+python3 -m moneywiz_api.cli.cli \
+  "/Users/dengxuhui/Library/Containers/com.moneywiz.personalfinance-setapp/Data/Documents/.AppData/ipadMoneyWiz.sqlite" \
+  --allow-main-db-write \
+  --add-transaction \
+  --kind "<expense|income>" \
+  --account-id <账户ID> \
+  --amount <正数金额> \
+  --payee-id <收付款对象ID> \
+  --desc "<描述，可空字符串>" \
+  --category "<分类名，可选>" \
+  --datetime "<YYYY-mm-dd HH:MM:SS>" \
+  --input-timezone "Asia/Shanghai" \
+  --trigger-sync \
+  --sync-mode applescript \
+  --sync-wait-mode stateful \
+  --sync-timeout-seconds 90
+```
+
+说明：
+
+- `PYTHONPATH=.../src` 是为了在未全局安装 CLI 的环境中直接调用模块。
+- `--sync-wait-mode stateful` 优先按同步状态关闭应用，而非固定等待。
+- `--sync-timeout-seconds 90` 建议作为默认超时，兼容慢网络。
+
+### 批量多条账单执行规范（强制）
+
+- 同一截图识别出多条账单时，按顺序逐条写入。
+- 前 N-1 条：不要加 `--trigger-sync`。
+- 最后一条：加 `--trigger-sync --sync-mode applescript --sync-wait-mode stateful`。
+
+### 批量模式（一次性传多条给 CLI）
+
+可通过 `--batch-file` 或 `--batch-json` 一次提交多条账单，
+CLI 内部会逐条写入，并按 `--batch-sync-last-only`（默认）仅在最后触发一次同步。
+
+示例（文件方式）：
+
+```bash
+PYTHONPATH="/Users/dengxuhui/Work/Personal/moneywiz-api/src" \
+python3 -m moneywiz_api.cli.cli \
+  "/Users/dengxuhui/Library/Containers/com.moneywiz.personalfinance-setapp/Data/Documents/.AppData/ipadMoneyWiz.sqlite" \
+  --allow-main-db-write \
+  --add-transaction \
+  --batch-file "/path/to/batch.json" \
+  --input-timezone "Asia/Shanghai" \
+  --trigger-sync \
+  --sync-mode applescript \
+  --sync-wait-mode stateful \
+  --sync-timeout-seconds 90
+```
+
+`batch.json` 格式：
+
+```json
+[
+  {
+    "kind": "expense",
+    "account_id": 1683,
+    "amount": 12.8,
+    "payee_id": 3856,
+    "desc": "午餐",
+    "category": "餐饮",
+    "notes": "第一条",
+    "datetime": "2026-03-07 12:30:00"
+  },
+  {
+    "kind": "expense",
+    "account_id": 1683,
+    "amount": 8.5,
+    "payee_id": 3856,
+    "desc": "咖啡",
+    "category": "饮品",
+    "notes": "第二条",
+    "datetime": "2026-03-07 15:20:00"
+  }
+]
+```
+
+### 失败重试规范（推荐）
+
+1. 写入失败：修复参数后重试该条，不要跳过。
+2. 写入成功但同步失败：仅重试“最后一条同步步骤”。
+3. 若连续 2 次同步失败：停止自动化并提示人工检查 MoneyWiz 状态/网络。
+
+### Agent 回执字段（建议）
+
+- `bookkeeping_status`: `success|failed`
+- `sync_status`: `success|failed|skipped`
+- `action`: `inserted|deduplicated`
+- `created_id`
+- `amount`
+- `desc`
+- `category`
+- `audit_log_path`

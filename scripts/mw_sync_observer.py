@@ -260,21 +260,93 @@ def sample_runtime_state(db_path: Path) -> dict[str, Any]:
     if table_stats["ZSYNCCOMMAND"].get("exists"):
         rows = cur.execute(
             """
-            SELECT Z_PK, ZCOMMANDID, ZISPENDING, ZOBJECTTYPE, ZOBJECTGID, ZREVISION
+            SELECT
+                Z_PK,
+                ZCOMMANDID,
+                ZISPENDING,
+                ZOBJECTTYPE,
+                ZOBJECTXMLDATATYPE,
+                ZOBJECTGID,
+                ZREVISION,
+                ZOBJECTXMLDATA
             FROM ZSYNCCOMMAND
             ORDER BY Z_PK DESC
             LIMIT 5
             """
         ).fetchall()
-        latest_sync_commands = [
+        for row in rows:
+            mapped = {k: to_jsonable(row[k]) for k in row.keys()}
+            raw_xml = mapped.get("ZOBJECTXMLDATA")
+            if isinstance(raw_xml, str):
+                mapped["ZOBJECTXMLDATA_PREVIEW"] = raw_xml[:240]
+                mapped["ZOBJECTXMLDATA_LEN"] = len(raw_xml)
+            mapped.pop("ZOBJECTXMLDATA", None)
+            latest_sync_commands.append(mapped)
+
+    latest_transactions = []
+    if table_stats["ZSYNCOBJECT"].get("exists"):
+        rows = cur.execute(
+            """
+            SELECT
+                Z_PK,
+                Z_ENT,
+                Z_OPT,
+                ZGID,
+                ZACCOUNT2,
+                ZPAYEE2,
+                ZAMOUNT1,
+                ZDATE1,
+                ZDESC2,
+                ZNOTES1
+            FROM ZSYNCOBJECT
+            WHERE Z_ENT IN (37, 45, 46, 47)
+            ORDER BY ZDATE1 DESC, Z_PK DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        latest_transactions = [
             {k: to_jsonable(row[k]) for k in row.keys()} for row in rows
         ]
+
+    latest_category_assignments = []
+    if table_stats["ZCATEGORYASSIGMENT"].get("exists"):
+        rows = cur.execute(
+            """
+            SELECT Z_PK, Z_OPT, ZCATEGORY, ZTRANSACTION, Z36_TRANSACTION, ZAMOUNT
+            FROM ZCATEGORYASSIGMENT
+            ORDER BY Z_PK DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        latest_category_assignments = [
+            {k: to_jsonable(row[k]) for k in row.keys()} for row in rows
+        ]
+
+    tx_signature = "|".join(
+        f"{r['Z_PK']}:{r['Z_OPT']}:{r.get('ZDESC2')}:{r.get('ZAMOUNT1')}:{r.get('ZDATE1')}"
+        for r in latest_transactions
+    )
+    ca_signature = "|".join(
+        f"{r['Z_PK']}:{r['Z_OPT']}:{r.get('ZTRANSACTION')}:{r.get('ZCATEGORY')}:{r.get('ZAMOUNT')}"
+        for r in latest_category_assignments
+    )
+    sc_signature = "|".join(
+        f"{r['Z_PK']}:{r.get('ZCOMMANDID')}:{r.get('ZISPENDING')}:{r.get('ZOBJECTTYPE')}:{r.get('ZOBJECTGID')}"
+        for r in latest_sync_commands
+    )
 
     con.close()
     return {
         "sample_at": now_iso(),
         "table_stats": table_stats,
         "latest_sync_commands": latest_sync_commands,
+        "latest_transactions": latest_transactions,
+        "latest_category_assignments": latest_category_assignments,
+        "signatures": {
+            "transactions": tx_signature,
+            "category_assignments": ca_signature,
+            "sync_commands": sc_signature,
+        },
     }
 
 
@@ -317,6 +389,25 @@ def watch_runtime(
                 }
             )
 
+        prev_sig = prev.get("signatures", {})
+        curr_sig = curr.get("signatures", {})
+        signature_changed = {}
+        for key in ["transactions", "category_assignments", "sync_commands"]:
+            if prev_sig.get(key) != curr_sig.get(key):
+                signature_changed[key] = {
+                    "old": prev_sig.get(key, "")[:400],
+                    "new": curr_sig.get(key, "")[:400],
+                }
+
+        if signature_changed:
+            transitions.append(
+                {
+                    "from": prev["sample_at"],
+                    "to": curr["sample_at"],
+                    "changed_signatures": signature_changed,
+                }
+            )
+
     return {
         "db_path": str(db_path),
         "started_at": samples[0]["sample_at"] if samples else now_iso(),
@@ -341,8 +432,12 @@ def print_watch_report(payload: dict[str, Any]) -> None:
 
     for item in payload["transitions"][:20]:
         print(f"- transition {item['from']} -> {item['to']}")
-        for table, change in item["changed"].items():
-            print(f"  {table}: {change['old']} -> {change['new']}")
+        if "changed" in item:
+            for table, change in item["changed"].items():
+                print(f"  {table}: {change['old']} -> {change['new']}")
+        if "changed_signatures" in item:
+            for section, change in item["changed_signatures"].items():
+                print(f"  signature[{section}]: {change['old']} -> {change['new']}")
 
 
 def print_human_report(diff: dict[str, Any]) -> None:

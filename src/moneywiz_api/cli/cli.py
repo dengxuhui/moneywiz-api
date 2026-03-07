@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import time
 from typing import Dict, List, Any, Optional
+from zoneinfo import ZoneInfo
 
 import click
 import pandas as pd
@@ -366,6 +367,22 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     return events
 
 
+def _parse_batch_datetime(raw: Optional[str], input_tz: ZoneInfo) -> datetime:
+    if not raw:
+        return datetime.now(input_tz)
+
+    text = raw.strip()
+    dt: datetime
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=input_tz)
+    return dt.astimezone(input_tz)
+
+
 @click.command()
 @click.argument(
     "DB_FILE_PATH",
@@ -437,6 +454,13 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     type=click.DateTime(formats=["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]),
     default=None,
     help="交易时间（可选，格式：YYYY-mm-dd HH:MM:SS 或 YYYY-mm-dd）",
+)
+@click.option(
+    "--input-timezone",
+    type=str,
+    default="Asia/Shanghai",
+    show_default=True,
+    help="--datetime 输入时间的时区（IANA 名称，例如 Asia/Shanghai）",
 )
 @click.option(
     "--dedupe-window-seconds",
@@ -529,10 +553,22 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     help="stateful 模式判定同步完成所需连续稳定次数",
 )
 @click.option(
-    "--nudge-sync/--no-nudge-sync",
+    "--batch-file",
+    type=click.Path(dir_okay=False, readable=True, exists=True, path_type=Path),
+    default=None,
+    help="批量记账 JSON 文件路径（一次传多条账单）",
+)
+@click.option(
+    "--batch-json",
+    type=str,
+    default=None,
+    help="批量记账 JSON 字符串（与 --batch-file 二选一）",
+)
+@click.option(
+    "--batch-sync-last-only/--batch-sync-each",
     default=True,
     show_default=True,
-    help="写入后先对交易做一次轻量更新，提升 App 触发同步概率（实验性）",
+    help="批量模式是否仅最后一条触发同步",
 )
 @click.option(
     "--show-auto-logs",
@@ -560,6 +596,7 @@ def main(
     notes,
     category_name,
     transaction_datetime,
+    input_timezone,
     dedupe_window_seconds,
     audit_log_path,
     allow_main_db_write,
@@ -574,7 +611,9 @@ def main(
     sync_wait_mode,
     sync_poll_interval_seconds,
     sync_stable_cycles,
-    nudge_sync,
+    batch_file,
+    batch_json,
+    batch_sync_last_only,
     show_auto_logs,
     last_n_logs,
 ):
@@ -637,6 +676,11 @@ def main(
         if sync_stable_cycles <= 0:
             raise ValueError("--sync-stable-cycles must be a positive integer")
 
+        try:
+            input_tz = ZoneInfo(input_timezone)
+        except Exception as error:
+            raise ValueError(f"Invalid --input-timezone: {input_timezone}") from error
+
         ensure_moneywiz_not_running()
 
         ensure_safe_write_target(
@@ -644,6 +688,9 @@ def main(
             allow_main_db_write=allow_main_db_write,
             skip_sidecar_check=skip_sidecar_check,
         )
+
+        if batch_file is not None and batch_json is not None:
+            raise ValueError("--batch-file and --batch-json cannot be used together")
 
         backup_path = None
         if backup_before_write:
@@ -654,9 +701,167 @@ def main(
         if transaction_datetime is None:
             transaction_datetime = datetime.now()
 
+        if transaction_datetime.tzinfo is None:
+            transaction_datetime = transaction_datetime.replace(tzinfo=input_tz)
+        else:
+            transaction_datetime = transaction_datetime.astimezone(input_tz)
+
         accessor = moneywiz_api.accessor
         get_account_currency = getattr(accessor, "get_account_currency")
         add_cash_transaction = getattr(accessor, "add_cash_transaction")
+
+        if batch_file is not None or batch_json is not None:
+            raw = batch_file.read_text(encoding="utf-8") if batch_file else batch_json
+            batch = json.loads(raw)
+            if not isinstance(batch, list) or len(batch) == 0:
+                raise ValueError("Batch payload must be a non-empty JSON array")
+
+            results: List[Dict[str, Any]] = []
+            for idx, item in enumerate(batch):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Batch item at index {idx} must be an object")
+
+                item_kind = str(item.get("kind") or kind or "").strip().lower()
+                if item_kind not in {"expense", "income"}:
+                    raise ValueError(f"Invalid kind at index {idx}: {item_kind}")
+
+                item_account_id = item.get("account_id", account_id)
+                if item_account_id is None:
+                    raise ValueError(f"Missing account_id at index {idx}")
+                item_account_id = int(item_account_id)
+
+                item_amount = item.get("amount")
+                if item_amount is None:
+                    raise ValueError(f"Missing amount at index {idx}")
+                item_amount_decimal = Decimal(str(item_amount))
+                if item_amount_decimal <= 0:
+                    raise ValueError(f"amount must be positive at index {idx}")
+
+                item_description = item.get("desc", description)
+                if item_description is None:
+                    raise ValueError(f"Missing desc at index {idx}")
+
+                item_payee_id = item.get("payee_id", payee_id)
+                if item_payee_id is not None:
+                    item_payee_id = int(item_payee_id)
+
+                item_notes = str(item.get("notes", notes))
+                item_category_name = item.get("category", category_name)
+                if item_category_name is not None:
+                    item_category_name = str(item_category_name)
+
+                item_dt = _parse_batch_datetime(item.get("datetime"), input_tz)
+                item_currency = get_account_currency(item_account_id)
+                if item_currency is None:
+                    raise ValueError(
+                        f"Account {item_account_id} not found or has no currency (index {idx})"
+                    )
+
+                transaction_id, inserted = add_cash_transaction(
+                    kind=item_kind,
+                    account_id=item_account_id,
+                    amount=item_amount_decimal,
+                    description=str(item_description),
+                    transaction_datetime=item_dt,
+                    original_currency=item_currency,
+                    notes=item_notes,
+                    payee_id=item_payee_id,
+                    dedupe_window_seconds=dedupe_window_seconds,
+                    category_name=item_category_name,
+                    write_datetime_utc0=True,
+                )
+
+                action = "inserted" if inserted else "deduplicated"
+                result = {
+                    "index": idx,
+                    "action": action,
+                    "transaction_id": transaction_id,
+                    "kind": item_kind,
+                    "account_id": item_account_id,
+                    "amount": float(item_amount_decimal),
+                    "desc": str(item_description),
+                    "category": item_category_name,
+                }
+                results.append(result)
+
+                audit_event = {
+                    "event": "auto_bookkeeping_write",
+                    "run_at": datetime.now().isoformat(),
+                    "status": "success",
+                    "action": action,
+                    "db_path": str(db_path),
+                    "batch_index": idx,
+                    "batch_size": len(batch),
+                    "kind": item_kind,
+                    "account_id": item_account_id,
+                    "amount": float(item_amount_decimal),
+                    "description": str(item_description),
+                    "payee_id": item_payee_id,
+                    "notes": item_notes,
+                    "category_name": item_category_name,
+                    "transaction_datetime": item_dt.isoformat(),
+                    "input_timezone": input_timezone,
+                    "original_currency": item_currency,
+                    "dedupe_window_seconds": dedupe_window_seconds,
+                    "allow_main_db_write": allow_main_db_write,
+                    "skip_sidecar_check": skip_sidecar_check,
+                    "backup_before_write": backup_before_write,
+                    "backup_path": str(backup_path) if backup_path else None,
+                    "trigger_sync": False,
+                    "sync_mode": sync_mode.lower(),
+                    "sync_wait_seconds": sync_wait_seconds,
+                    "sync_wait_mode": sync_wait_mode.lower(),
+                    "sync_poll_interval_seconds": sync_poll_interval_seconds,
+                    "sync_stable_cycles": sync_stable_cycles,
+                    "created_id": transaction_id,
+                }
+                write_audit_log(audit_log_path, audit_event)
+
+            if trigger_sync:
+                if batch_sync_last_only:
+                    sync_result = None
+                    if sync_mode.lower() == "applescript":
+                        sync_result = trigger_sync_via_applescript(
+                            db_path=db_path,
+                            wait_mode=sync_wait_mode.lower(),
+                            sync_wait_seconds=sync_wait_seconds,
+                            sync_timeout_seconds=sync_timeout_seconds,
+                            sync_poll_interval_seconds=sync_poll_interval_seconds,
+                            sync_stable_cycles=sync_stable_cycles,
+                        )
+                    else:
+                        final_sync_command = sync_command or os.getenv(
+                            "MONEYWIZ_SYNC_COMMAND"
+                        )
+                        if not final_sync_command:
+                            raise RuntimeError(
+                                "--trigger-sync 已开启，但未提供 --sync-command，"
+                                "且环境变量 MONEYWIZ_SYNC_COMMAND 未设置。"
+                            )
+                        sync_result = trigger_sync_command(
+                            final_sync_command,
+                            timeout_seconds=sync_timeout_seconds,
+                        )
+
+                    if sync_result["returncode"] != 0:
+                        raise RuntimeError(
+                            "批量模式同步失败，"
+                            f"returncode={sync_result['returncode']}, stderr={sync_result.get('stderr', '')}"
+                        )
+                else:
+                    raise RuntimeError("--batch-sync-each is not supported yet")
+
+            click.secho(
+                f"Batch completed: {len(results)} item(s), inserted={sum(1 for r in results if r['action'] == 'inserted')}, deduplicated={sum(1 for r in results if r['action'] == 'deduplicated')}",
+                fg="green",
+            )
+            if backup_path is not None:
+                click.secho(f"Database backup created at {backup_path}", fg="cyan")
+            if trigger_sync:
+                click.secho("Sync command finished successfully", fg="green")
+            click.secho(f"Audit log written to {audit_log_path}", fg="cyan")
+            click.echo(json.dumps({"results": results}, ensure_ascii=False, indent=2))
+            return
 
         currency = get_account_currency(account_id)
         if currency is None:
@@ -675,6 +880,7 @@ def main(
             "notes": notes,
             "category_name": category_name,
             "transaction_datetime": transaction_datetime.isoformat(),
+            "input_timezone": input_timezone,
             "original_currency": currency,
             "dedupe_window_seconds": dedupe_window_seconds,
             "allow_main_db_write": allow_main_db_write,
@@ -687,7 +893,6 @@ def main(
             "sync_wait_mode": sync_wait_mode.lower(),
             "sync_poll_interval_seconds": sync_poll_interval_seconds,
             "sync_stable_cycles": sync_stable_cycles,
-            "nudge_sync": nudge_sync,
         }
 
         try:
@@ -702,17 +907,13 @@ def main(
                 payee_id=payee_id,
                 dedupe_window_seconds=dedupe_window_seconds,
                 category_name=category_name,
+                write_datetime_utc0=True,
             )
             created_record = accessor.get_record(transaction_id)
             audit_event["status"] = "success"
             audit_event["action"] = "inserted" if inserted else "deduplicated"
             audit_event["created_id"] = transaction_id
             audit_event["created_gid"] = created_record.gid
-
-            if trigger_sync and nudge_sync:
-                nudge = getattr(accessor, "nudge_transaction_for_sync")
-                nudge_changed = nudge(transaction_id)
-                audit_event["nudge_sync_applied"] = nudge_changed
 
             if trigger_sync:
                 if sync_mode.lower() == "applescript":

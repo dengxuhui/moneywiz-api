@@ -1,11 +1,12 @@
 import sqlite3
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Any, Callable, Tuple, Optional
 import random
 from uuid import uuid4
+from xml.sax.saxutils import escape
 
 from moneywiz_api.model.record import Record
 from moneywiz_api.model.raw_data_handler import RawDataHandler as RDH
@@ -202,6 +203,214 @@ class DatabaseAccessor:
             return 1.0
         return float(rate)
 
+    def _next_sync_command_id(self) -> ID:
+        cur = self._con.cursor()
+        row = cur.execute(
+            "SELECT COALESCE(MAX(Z_PK), 0) + 1 AS NEXT_PK FROM ZSYNCCOMMAND"
+        ).fetchone()
+        return row["NEXT_PK"]
+
+    def _next_sync_revision(self, user_id: ID) -> int:
+        cur = self._con.cursor()
+        row = cur.execute(
+            """
+            SELECT COALESCE(MAX(ZREVISION), 0) + 1 AS NEXT_REV
+            FROM ZSYNCCOMMAND
+            WHERE ZUSER = ?
+            """,
+            [user_id],
+        ).fetchone()
+        return int(row["NEXT_REV"])
+
+    def _serialize_transaction_xml_data(self, transaction_id: ID) -> str:
+        cur = self._con.cursor()
+        row = cur.execute(
+            """
+            SELECT
+                ZGID,
+                ZSTATUS1,
+                ZCHECKBOOKNUMBER,
+                ZAMOUNT1,
+                ZPRICEPERSHARE1,
+                ZCURRENCYEXCHANGERATE,
+                ZORIGINALAMOUNT,
+                ZORIGINALCURRENCY,
+                ZFLAGS1,
+                ZMARKEDASNEWSINCEDATE,
+                ZDATE1,
+                ZDESC2,
+                ZNOTES1,
+                ZORIGINALFEE,
+                ZFEE2,
+                ZORIGINALEXCHANGERATE,
+                ZRECONCILED,
+                ZVOIDCHEQUE,
+                ZACCOUNT2,
+                Z9_ACCOUNT2,
+                ZPAYEE2,
+                Z_ENT,
+                ZOBJECTCREATIONDATE,
+                Z_OPT
+            FROM ZSYNCOBJECT
+            WHERE Z_PK = ?
+            """,
+            [transaction_id],
+        ).fetchone()
+        if not row:
+            raise RuntimeError(
+                f"Cannot find transaction for xml serialization: {transaction_id}"
+            )
+
+        category_rows = cur.execute(
+            """
+            SELECT
+                ca.ZAMOUNT,
+                c.ZGID AS CATEGORY_GID,
+                c.ZNAME2 AS CATEGORY_NAME
+            FROM ZCATEGORYASSIGMENT ca
+            JOIN ZSYNCOBJECT c ON c.Z_PK = ca.ZCATEGORY
+            WHERE ZTRANSACTION = ?
+            ORDER BY ca.Z_PK
+            """,
+            [transaction_id],
+        ).fetchall()
+
+        payee_name = ""
+        payee_gid = ""
+        if row["ZPAYEE2"] is not None:
+            payee_row = cur.execute(
+                "SELECT ZNAME5, ZGID FROM ZSYNCOBJECT WHERE Z_PK = ?",
+                [row["ZPAYEE2"]],
+            ).fetchone()
+            if payee_row:
+                if payee_row["ZNAME5"]:
+                    payee_name = str(payee_row["ZNAME5"])
+                if payee_row["ZGID"]:
+                    payee_gid = str(payee_row["ZGID"])
+
+        account_gid = ""
+        if row["ZACCOUNT2"] is not None:
+            account_row = cur.execute(
+                "SELECT ZGID FROM ZSYNCOBJECT WHERE Z_PK = ?",
+                [row["ZACCOUNT2"]],
+            ).fetchone()
+            if account_row and account_row["ZGID"]:
+                account_gid = str(account_row["ZGID"])
+
+        def value(key: str, default: Any = "") -> Any:
+            v = row[key]
+            return default if v is None else v
+
+        transaction_type = (
+            "Expense transaction"
+            if int(value("Z_ENT", 47)) == 47
+            else "Income transaction"
+        )
+        dt_obj = get_datetime(float(value("ZDATE1", 0)))
+        dt_iso = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+        dt_offset = dt_obj.strftime("%z") or "+0000"
+        categories_xml = "<categories></categories>"
+        if category_rows:
+            items = []
+            for category_row in category_rows:
+                items.append(
+                    "<category objectGID='"
+                    + escape(str(category_row["CATEGORY_GID"]))
+                    + "' name='"
+                    + escape(str(category_row["CATEGORY_NAME"]))
+                    + "' amount='"
+                    + escape(str(category_row["ZAMOUNT"]))
+                    + "'></category>"
+                )
+            categories_xml = "<categories>" + "".join(items) + "</categories>"
+
+        cutoff_utc = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp()
+        object_creation_date_1970 = float(value("ZOBJECTCREATIONDATE", 0)) + cutoff_utc
+
+        xml = (
+            "<objectData "
+            + f"status='{escape(str(value('ZSTATUS1', 2)))}' "
+            + f"checkbookNumber='{escape(str(value('ZCHECKBOOKNUMBER', '')))}' "
+            + f"amount='{escape(str(value('ZAMOUNT1', 0)))}' "
+            + f"pricePerShare='{escape(str(value('ZPRICEPERSHARE1', 0)))}' "
+            + f"currencyExchangeRate='{escape(str(value('ZCURRENCYEXCHANGERATE', 1)))}' "
+            + f"original_amount='{escape(str(value('ZORIGINALAMOUNT', 0)))}' "
+            + f"original_currency='{escape(str(value('ZORIGINALCURRENCY', 'CNY')))}' "
+            + f"flags='{escape(str(value('ZFLAGS1', 0)))}' "
+            + f"markedAsNewSinceDate='{escape(str(value('ZMARKEDASNEWSINCEDATE', '')))}' "
+            + f"type='{escape(transaction_type)}' "
+            + f"date='{escape(dt_iso + ' ' + dt_offset)}' "
+            + "autoSkipLinkedScheduledTransactionGID='' "
+            + f"originalFee='{escape(str(value('ZORIGINALFEE', 0)))}' "
+            + f"payeeName='{escape(payee_name)}' "
+            + f"account_gid='{escape(account_gid)}' "
+            + f"reconciled='{escape('1' if int(value('ZRECONCILED', 0)) else '0')}' "
+            + f"objectGID='{escape(str(value('ZGID', '')))}' "
+            + f"isVoidCheque='{escape('1' if int(value('ZVOIDCHEQUE', 0)) else '0')}' "
+            + f"notes='{escape(str(value('ZNOTES1', '')))}' "
+            + f"desc='{escape(str(value('ZDESC2', '')))}' "
+            + f"fee='{escape(str(value('ZFEE2', 0)))}' "
+            + f"original_exchangeRate='{escape(str(value('ZORIGINALEXCHANGERATE', 1)))}' "
+            + f"payeeGID='{escape(payee_gid)}' "
+            + f"objectCreationDate1970='{escape(str(object_creation_date_1970))}'"
+            + ">"
+            + categories_xml
+            + "<images></images>"
+            + "<tags_list></tags_list>"
+            + "</objectData>"
+        )
+        return xml
+
+    def enqueue_transaction_sync_command(self, transaction_id: ID) -> ID:
+        cur = self._con.cursor()
+        tx = cur.execute(
+            "SELECT ZGID, ZUSER FROM ZSYNCOBJECT WHERE Z_PK = ?",
+            [transaction_id],
+        ).fetchone()
+        if not tx:
+            raise RuntimeError(f"Cannot find transaction for enqueue: {transaction_id}")
+
+        transaction_gid = tx["ZGID"]
+        user_id = tx["ZUSER"] if tx["ZUSER"] is not None else 2
+
+        command_id = self._next_sync_command_id()
+        revision = self._next_sync_revision(user_id)
+        xml_data = self._serialize_transaction_xml_data(transaction_id)
+
+        cur.execute(
+            """
+            INSERT INTO ZSYNCCOMMAND (
+                Z_PK,
+                Z_ENT,
+                Z_OPT,
+                ZCOMMANDID,
+                ZISPENDING,
+                ZOBJECTTYPE,
+                ZOBJECTXMLDATATYPE,
+                ZORDER,
+                ZREVISION,
+                ZUSER,
+                ZOBJECTGID,
+                ZOBJECTXMLDATA
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                command_id,
+                7,
+                1,
+                0,
+                0,
+                1,
+                0,
+                0,
+                revision,
+                user_id,
+                transaction_gid,
+                xml_data,
+            ],
+        )
+        return command_id
+
     def _next_pk_id(self) -> ID:
         cur = self._con.cursor()
         res = cur.execute(
@@ -326,6 +535,7 @@ class DatabaseAccessor:
         dedupe_window_seconds: int = 600,
         dedupe_amount_tolerance: Decimal = Decimal("0.01"),
         category_name: Optional[str] = None,
+        write_datetime_utc0: bool = True,
     ) -> Tuple[ID, bool]:
         kind_to_ent = {
             "expense": "WithdrawTransaction",
@@ -355,10 +565,17 @@ class DatabaseAccessor:
         _, account_ent = account_meta
 
         cur = self._con.cursor()
+
+        def to_moneywiz_date(dt: datetime) -> float:
+            if write_datetime_utc0:
+                cutoff_utc = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp()
+                return dt.timestamp() - cutoff_utc
+            return get_date(dt)
+
         try:
             cur.execute("BEGIN IMMEDIATE")
 
-            date_value = get_date(transaction_datetime)
+            date_value = to_moneywiz_date(transaction_datetime)
             duplicate = cur.execute(
                 """
             SELECT Z_PK
@@ -402,7 +619,10 @@ class DatabaseAccessor:
                 f"{str(uuid4()).upper()}-{random.randint(10000, 99999)}-"
                 f"{uuid4().hex[:16].upper()}"
             )
-            now_value = get_date(datetime.now())
+            now_dt = (
+                datetime.now(timezone.utc) if write_datetime_utc0 else datetime.now()
+            )
+            now_value = to_moneywiz_date(now_dt)
             exchange_rate = self.get_account_exchange_rate(account_id)
 
             cur.execute(
@@ -476,30 +696,10 @@ class DatabaseAccessor:
                         category_id=category_id,
                         amount=normalized_amount,
                     )
+
+            self.enqueue_transaction_sync_command(next_id)
             self._con.commit()
             return next_id, True
-        except Exception:
-            self._con.rollback()
-            raise
-
-    def nudge_transaction_for_sync(self, transaction_id: ID) -> bool:
-        """轻量触发记录变更，帮助 MoneyWiz 生成同步队列（实验性）。"""
-        cur = self._con.cursor()
-        try:
-            cur.execute("BEGIN IMMEDIATE")
-            now_value = get_date(datetime.now())
-            cur.execute(
-                """
-                UPDATE ZSYNCOBJECT
-                SET Z_OPT = COALESCE(Z_OPT, 0) + 1,
-                    ZMARKEDASNEWSINCEDATE = ?
-                WHERE Z_PK = ? AND Z_ENT IN (37, 47)
-                """,
-                [now_value, transaction_id],
-            )
-            changed = cur.rowcount > 0
-            self._con.commit()
-            return changed
         except Exception:
             self._con.rollback()
             raise
