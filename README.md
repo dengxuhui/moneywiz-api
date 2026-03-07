@@ -102,6 +102,9 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
 - `--sync-timeout-seconds`：同步命令超时时间（默认 60 秒）
 - `--sync-mode`：同步模式，`applescript`（默认）或 `command`
 - `--sync-wait-seconds`：`applescript` 模式下打开 MoneyWiz 后等待秒数（默认 20）
+- `--sync-wait-mode`：`applescript` 等待模式，`stateful`（默认）或 `fixed`
+- `--sync-poll-interval-seconds`：`stateful` 模式轮询间隔（默认 2 秒）
+- `--sync-stable-cycles`：`stateful` 模式判定完成所需连续稳定次数（默认 3）
 
 ### 3) 查看自动记账审计日志
 
@@ -123,10 +126,18 @@ moneywiz-cli "/path/to/ipadMoneyWiz.sqlite" \
   --desc "午餐" \
   --trigger-sync \
   --sync-mode applescript \
-  --sync-wait-seconds 20
+  --sync-wait-mode stateful \
+  --sync-timeout-seconds 60
 ```
 
 `applescript` 模式会自动执行：打开 MoneyWiz -> 等待 -> 退出。
+
+`stateful` 等待模式会轮询同步状态（`ZSYNCCOMMAND.ZISPENDING`），
+尽量在“同步空闲”后立即关闭，而不是固定睡眠。
+若超时仍未空闲，则按失败处理并保留审计信息。
+
+`applescript` 模式会自动探测本机已安装的 MoneyWiz（优先 Setapp 版本），
+无需用户手动提供 app 名称或 bundle id。
 
 如需自定义命令，可切换到 `command` 模式：
 

@@ -13,7 +13,8 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
-from typing import Dict, List, Any
+import time
+from typing import Dict, List, Any, Optional
 
 import click
 import pandas as pd
@@ -126,23 +127,176 @@ def ensure_moneywiz_not_running() -> None:
         )
 
 
-def trigger_sync_via_applescript(sync_wait_seconds: int = 20) -> Dict[str, Any]:
-    script = (
-        'tell application "MoneyWiz" to activate\n'
-        f"delay {sync_wait_seconds}\n"
-        'tell application "MoneyWiz" to quit\n'
+def _detect_moneywiz_app_id() -> Optional[str]:
+    candidates = [
+        "com.moneywiz.personalfinance-setapp",
+        "com.moneywiz.personalfinance",
+    ]
+
+    for app_id in candidates:
+        check = subprocess.run(
+            ["osascript", "-e", f'id of app "{app_id}"'],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if check.returncode == 0:
+            return app_id
+
+    check_name = subprocess.run(
+        ["osascript", "-e", 'id of app "MoneyWiz"'],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
     )
+    if check_name.returncode == 0:
+        return "MoneyWiz"
+    return None
+
+
+def _run_applescript_for_app(app_id_or_name: str, action: str) -> Dict[str, Any]:
+    if app_id_or_name == "MoneyWiz":
+        script = f'tell application "MoneyWiz" to {action}'
+    else:
+        script = f'tell application id "{app_id_or_name}" to {action}'
+
     completed = subprocess.run(
         ["osascript", "-e", script],
         check=False,
         capture_output=True,
         text=True,
-        timeout=max(30, sync_wait_seconds + 10),
+        timeout=10,
     )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout.strip(),
         "stderr": completed.stderr.strip(),
+    }
+
+
+def _get_sync_pending_count(db_path: Path) -> Optional[int]:
+    con = None
+    try:
+        con = sqlite3.connect(db_path, timeout=1.0)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("PRAGMA busy_timeout = 1000")
+        exists = cur.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM sqlite_master
+            WHERE type='table' AND name='ZSYNCCOMMAND'
+            """
+        ).fetchone()["c"]
+        if exists == 0:
+            return None
+        row = cur.execute(
+            "SELECT COUNT(*) AS c FROM ZSYNCCOMMAND WHERE ZISPENDING = 1"
+        ).fetchone()
+        return int(row["c"])
+    except Exception:
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _wait_for_sync_idle(
+    *,
+    db_path: Path,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    stable_cycles: int,
+) -> Dict[str, Any]:
+    start = time.monotonic()
+    stable_count = 0
+    observed: List[Optional[int]] = []
+
+    while time.monotonic() - start < timeout_seconds:
+        pending_count = _get_sync_pending_count(db_path)
+        observed.append(pending_count)
+
+        if pending_count == 0:
+            stable_count += 1
+            if stable_count >= stable_cycles:
+                return {
+                    "completed": True,
+                    "reason": "pending_zero_stable",
+                    "observed": observed[-20:],
+                    "elapsed_seconds": round(time.monotonic() - start, 2),
+                }
+        else:
+            stable_count = 0
+
+        time.sleep(poll_interval_seconds)
+
+    return {
+        "completed": False,
+        "reason": "timeout",
+        "observed": observed[-20:],
+        "elapsed_seconds": round(time.monotonic() - start, 2),
+    }
+
+
+def trigger_sync_via_applescript(
+    *,
+    db_path: Path,
+    wait_mode: str,
+    sync_wait_seconds: int,
+    sync_timeout_seconds: int,
+    sync_poll_interval_seconds: int,
+    sync_stable_cycles: int,
+) -> Dict[str, Any]:
+    selected_app_id = _detect_moneywiz_app_id()
+
+    if selected_app_id is None:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "No local MoneyWiz app detected for AppleScript sync",
+        }
+
+    activate_result = _run_applescript_for_app(selected_app_id, "activate")
+    if activate_result["returncode"] != 0:
+        return {
+            "returncode": activate_result["returncode"],
+            "stdout": activate_result["stdout"],
+            "stderr": activate_result["stderr"],
+            "app_id": selected_app_id,
+            "wait_mode": wait_mode,
+        }
+
+    wait_result: Dict[str, Any]
+    if wait_mode == "stateful":
+        wait_result = _wait_for_sync_idle(
+            db_path=db_path,
+            timeout_seconds=sync_timeout_seconds,
+            poll_interval_seconds=sync_poll_interval_seconds,
+            stable_cycles=sync_stable_cycles,
+        )
+    else:
+        time.sleep(sync_wait_seconds)
+        wait_result = {
+            "completed": True,
+            "reason": "fixed_sleep",
+            "observed": [],
+            "elapsed_seconds": float(sync_wait_seconds),
+        }
+
+    quit_result = _run_applescript_for_app(selected_app_id, "quit")
+    returncode = 0 if quit_result["returncode"] == 0 and wait_result["completed"] else 1
+
+    return {
+        "returncode": returncode,
+        "stdout": activate_result["stdout"] or quit_result["stdout"],
+        "stderr": activate_result["stderr"] or quit_result["stderr"],
+        "app_id": selected_app_id,
+        "wait_mode": wait_mode,
+        "sync_wait_reason": wait_result["reason"],
+        "sync_wait_elapsed_seconds": wait_result["elapsed_seconds"],
+        "sync_pending_observed": wait_result["observed"],
     }
 
 
@@ -326,6 +480,27 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     help="applescript 同步模式中打开 MoneyWiz 后等待秒数",
 )
 @click.option(
+    "--sync-wait-mode",
+    type=click.Choice(["fixed", "stateful"], case_sensitive=False),
+    default="stateful",
+    show_default=True,
+    help="applescript 等待模式：fixed=固定等待，stateful=轮询同步状态",
+)
+@click.option(
+    "--sync-poll-interval-seconds",
+    type=int,
+    default=2,
+    show_default=True,
+    help="stateful 模式轮询间隔秒数",
+)
+@click.option(
+    "--sync-stable-cycles",
+    type=int,
+    default=3,
+    show_default=True,
+    help="stateful 模式判定同步完成所需连续稳定次数",
+)
+@click.option(
     "--show-auto-logs",
     is_flag=True,
     help="查看自动记账审计日志并退出",
@@ -362,6 +537,9 @@ def main(
     sync_timeout_seconds,
     sync_mode,
     sync_wait_seconds,
+    sync_wait_mode,
+    sync_poll_interval_seconds,
+    sync_stable_cycles,
     show_auto_logs,
     last_n_logs,
 ):
@@ -419,6 +597,10 @@ def main(
             raise ValueError("--sync-timeout-seconds must be a positive integer")
         if sync_wait_seconds <= 0:
             raise ValueError("--sync-wait-seconds must be a positive integer")
+        if sync_poll_interval_seconds <= 0:
+            raise ValueError("--sync-poll-interval-seconds must be a positive integer")
+        if sync_stable_cycles <= 0:
+            raise ValueError("--sync-stable-cycles must be a positive integer")
 
         ensure_moneywiz_not_running()
 
@@ -467,6 +649,9 @@ def main(
             "trigger_sync": trigger_sync,
             "sync_mode": sync_mode.lower(),
             "sync_wait_seconds": sync_wait_seconds,
+            "sync_wait_mode": sync_wait_mode.lower(),
+            "sync_poll_interval_seconds": sync_poll_interval_seconds,
+            "sync_stable_cycles": sync_stable_cycles,
         }
 
         try:
@@ -491,9 +676,14 @@ def main(
             if trigger_sync:
                 if sync_mode.lower() == "applescript":
                     sync_result = trigger_sync_via_applescript(
+                        db_path=db_path,
+                        wait_mode=sync_wait_mode.lower(),
                         sync_wait_seconds=sync_wait_seconds,
+                        sync_timeout_seconds=sync_timeout_seconds,
+                        sync_poll_interval_seconds=sync_poll_interval_seconds,
+                        sync_stable_cycles=sync_stable_cycles,
                     )
-                    audit_event["sync_command"] = "osascript: activate->delay->quit"
+                    audit_event["sync_command"] = "osascript: activate->wait-mode->quit"
                 else:
                     final_sync_command = sync_command or os.getenv(
                         "MONEYWIZ_SYNC_COMMAND"
@@ -513,6 +703,20 @@ def main(
                 audit_event["sync_returncode"] = sync_result["returncode"]
                 audit_event["sync_stdout"] = sync_result["stdout"][:2000]
                 audit_event["sync_stderr"] = sync_result["stderr"][:2000]
+                if "app_id" in sync_result:
+                    audit_event["sync_app_id"] = sync_result["app_id"]
+                if "wait_mode" in sync_result:
+                    audit_event["sync_wait_mode"] = sync_result["wait_mode"]
+                if "sync_wait_reason" in sync_result:
+                    audit_event["sync_wait_reason"] = sync_result["sync_wait_reason"]
+                if "sync_wait_elapsed_seconds" in sync_result:
+                    audit_event["sync_wait_elapsed_seconds"] = sync_result[
+                        "sync_wait_elapsed_seconds"
+                    ]
+                if "sync_pending_observed" in sync_result:
+                    audit_event["sync_pending_observed"] = sync_result[
+                        "sync_pending_observed"
+                    ]
                 audit_event["sync_status"] = (
                     "success" if sync_result["returncode"] == 0 else "failed"
                 )
