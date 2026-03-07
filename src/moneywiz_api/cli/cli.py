@@ -137,7 +137,7 @@ def _detect_moneywiz_app_id() -> Optional[str]:
         check = subprocess.run(
             [
                 "mdfind",
-                f"kMDItemCFBundleIdentifier == '{app_id}' && kMDItemKind == 'Application'",
+                f"kMDItemCFBundleIdentifier == '{app_id}'",
             ],
             check=False,
             capture_output=True,
@@ -146,6 +146,31 @@ def _detect_moneywiz_app_id() -> Optional[str]:
         )
         if check.returncode == 0 and check.stdout.strip():
             return app_id
+
+    broad = subprocess.run(
+        ["mdfind", "MoneyWiz"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if broad.returncode == 0 and broad.stdout.strip():
+        for raw_path in broad.stdout.splitlines():
+            app_path = raw_path.strip()
+            if not app_path.endswith(".app"):
+                continue
+            mdls = subprocess.run(
+                ["mdls", "-name", "kMDItemCFBundleIdentifier", "-raw", app_path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if mdls.returncode != 0:
+                continue
+            bundle_id = mdls.stdout.strip()
+            if bundle_id.startswith("com.moneywiz.personalfinance"):
+                return bundle_id
 
     check_name = subprocess.run(
         ["osascript", "-e", 'id of app "MoneyWiz"'],
@@ -504,6 +529,12 @@ def read_last_audit_events(log_path: Path, last: int) -> List[Dict[str, Any]]:
     help="stateful 模式判定同步完成所需连续稳定次数",
 )
 @click.option(
+    "--nudge-sync/--no-nudge-sync",
+    default=True,
+    show_default=True,
+    help="写入后先对交易做一次轻量更新，提升 App 触发同步概率（实验性）",
+)
+@click.option(
     "--show-auto-logs",
     is_flag=True,
     help="查看自动记账审计日志并退出",
@@ -543,6 +574,7 @@ def main(
     sync_wait_mode,
     sync_poll_interval_seconds,
     sync_stable_cycles,
+    nudge_sync,
     show_auto_logs,
     last_n_logs,
 ):
@@ -655,6 +687,7 @@ def main(
             "sync_wait_mode": sync_wait_mode.lower(),
             "sync_poll_interval_seconds": sync_poll_interval_seconds,
             "sync_stable_cycles": sync_stable_cycles,
+            "nudge_sync": nudge_sync,
         }
 
         try:
@@ -675,6 +708,11 @@ def main(
             audit_event["action"] = "inserted" if inserted else "deduplicated"
             audit_event["created_id"] = transaction_id
             audit_event["created_gid"] = created_record.gid
+
+            if trigger_sync and nudge_sync:
+                nudge = getattr(accessor, "nudge_transaction_for_sync")
+                nudge_changed = nudge(transaction_id)
+                audit_event["nudge_sync_applied"] = nudge_changed
 
             if trigger_sync:
                 if sync_mode.lower() == "applescript":

@@ -481,3 +481,25 @@ class DatabaseAccessor:
         except Exception:
             self._con.rollback()
             raise
+
+    def nudge_transaction_for_sync(self, transaction_id: ID) -> bool:
+        """轻量触发记录变更，帮助 MoneyWiz 生成同步队列（实验性）。"""
+        cur = self._con.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            now_value = get_date(datetime.now())
+            cur.execute(
+                """
+                UPDATE ZSYNCOBJECT
+                SET Z_OPT = COALESCE(Z_OPT, 0) + 1,
+                    ZMARKEDASNEWSINCEDATE = ?
+                WHERE Z_PK = ? AND Z_ENT IN (37, 47)
+                """,
+                [now_value, transaction_id],
+            )
+            changed = cur.rowcount > 0
+            self._con.commit()
+            return changed
+        except Exception:
+            self._con.rollback()
+            raise
